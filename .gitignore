@@ -1,0 +1,152 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre
+.pyre/
+
+# pytype
+.pytype/
+
+# Unreal Engine / Cosys-AirSim
+Blocks/Binaries/
+Blocks/Build/
+Blocks/DerivedDataCache/
+Blocks/Intermediate/
+Blocks/Saved/
+Blocks/.vs/
+Blocks/*.sln
+Blocks/*.suo
+Blocks/*.opensdf
+Blocks/*.sdf
+Blocks/*.VC.db
+Blocks/*.VC.opendb
+
+# Unreal Engine specific
+*.uasset
+*.umap
+*.upk
+*.udk
+
+# OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Windows
+$RECYCLE.BIN/
+*.lnk
+
+# Logs
+*.log
+logs/
+*.out
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+
+# Data files (if any)
+data/
+*.csv
+*.json
+*.pkl
+*.pickle
+
+# Documentation build
+docs/_build/
+docs/_static/
+docs/_templates/
+
+# Project specific
+nulpython
+*.bak
+*.old
+
+# AirSim settings and logs
+AirSimSettings.json
+airsim_rec.txt
+airsim_drone.txt
+
+# Recordings and screenshots
+recordings/
+screenshots/
+*.mp4
+*.avi
+*.png
+*.jpg
+*.jpeg
+
+# Configuration files (keep templates, ignore local configs)
+config_local.py
+settings_local.json
+
+Blocks/

@@ -1,0 +1,24 @@
+# CMSE443 Quadcopter Simulator - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Cosys-AirSim Python Client (already installed if simulator working)
+# cosysairsim
+
+# Core dependencies
+numpy>=1.21.0
+
+# Xbox Controller Support (Windows)
+XInput-Python>=0.4.0
+
+# Keyboard Input (fallback)
+keyboard>=0.13.5
+
+# GUI (usually included with Python)
+# tkinter - included in standard library
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Optional: For better timing on Windows
+# pywin32>=305
