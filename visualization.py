@@ -1014,6 +1014,19 @@ class VisualizationGUI:
         self.gui_thread = threading.Thread(target=self._run_gui, daemon=True)
         self.gui_thread.start()
 
+    def start_in_main_thread(self):
+        """Start the GUI in the main thread (required for Windows)."""
+        self.running = True
+        self._create_gui()
+        if self.root:
+            self.root.after(50, self._update_gui)
+            # Don't call mainloop here - let caller handle it
+    
+    def run_mainloop(self):
+        """Run the tkinter mainloop (call from main thread)."""
+        if self.root:
+            self.root.mainloop()
+
     def _run_gui(self):
         """Run the GUI main loop."""
         self._create_gui()
@@ -1025,7 +1038,10 @@ class VisualizationGUI:
         """Stop the GUI."""
         self.running = False
         if self.root:
-            self.root.after(0, lambda: self._on_close())
+            try:
+                self.root.after(0, lambda: self._on_close())
+            except Exception:
+                pass
 
     def is_running(self) -> bool:
         """Check if GUI is running."""

@@ -267,6 +267,9 @@ class QuadcopterController:
 
         # Thread for control loop
         self.control_thread: Optional[threading.Thread] = None
+        
+        # Thread-local AirSim client for control loop (created in control thread)
+        self.control_client: Optional[airsim.MultirotorClient] = None
 
     def connect(self) -> bool:
         """
@@ -336,7 +339,7 @@ class QuadcopterController:
             f"Timing analyzer initialized. Target period: {self.loop_period_ms:.1f}ms"
         )
 
-        # Initialize GUI
+        # Initialize GUI (but don't start mainloop yet - will run in main thread)
         if self.use_gui:
             self.gui = VisualizationGUI("CMSE443 Quadcopter Simulator - Cosys-AirSim")
             self.gui.set_callbacks(
@@ -346,8 +349,9 @@ class QuadcopterController:
                 on_arm=self._on_gui_arm,
                 on_parameter_change=self._on_gui_parameter_change,
             )
-            self.gui.start()
-            print("GUI initialized and started.")
+            # Initialize GUI in main thread (don't start mainloop yet)
+            self.gui.start_in_main_thread()
+            print("[DEBUG] GUI initialized in main thread.")
 
         print("All components initialized successfully!\n")
         return True
@@ -408,26 +412,36 @@ class QuadcopterController:
         Returns:
             True if arming successful
         """
+        print(f"[DEBUG] arm() called. connected={self.connected}, client={self.client is not None}")
         client = self.client
         if not self.connected or client is None:
-            print("Cannot arm: Not connected to simulator")
+            print("[DEBUG] Cannot arm: Not connected to simulator")
             return False
 
         try:
-            client.enableApiControl(True)
-            client.armDisarm(True)
+            print("[DEBUG] Enabling API control...")
+            client.enableApiControl(True, vehicle_name="Drone1")
+            print("[DEBUG] API control enabled. Arming drone...")
+            client.armDisarm(True, vehicle_name="Drone1")
             self.armed = True
-            print("Drone armed!")
+            print("[DEBUG] Drone armed successfully!")
 
             # Vibrate controller to confirm
             if self.input_handler:
+                print("[DEBUG] Vibrating controller...")
                 self.input_handler.set_vibration(0.5, 0.5)
                 time.sleep(0.2)
                 self.input_handler.stop_vibration()
 
+            # Automatically takeoff after arming
+            print("[DEBUG] Calling takeoff()...")
+            self.takeoff()
+
             return True
         except Exception as e:
-            print(f"Failed to arm: {e}")
+            print(f"[DEBUG] Failed to arm: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def disarm(self) -> bool:
@@ -442,8 +456,8 @@ class QuadcopterController:
             return False
 
         try:
-            client.armDisarm(False)
-            client.enableApiControl(False)
+            client.armDisarm(False, vehicle_name="Drone1")
+            client.enableApiControl(False, vehicle_name="Drone1")
             self.armed = False
             print("Drone disarmed!")
             return True
@@ -453,7 +467,7 @@ class QuadcopterController:
 
     def takeoff(self, altitude: float = 3.0) -> bool:
         """
-        Perform automated takeoff.
+        Perform automated takeoff (non-blocking).
 
         Args:
             altitude: Target altitude in meters
@@ -463,17 +477,33 @@ class QuadcopterController:
             print("Cannot takeoff: Drone not armed")
             return False
 
-        try:
-            print(f"Taking off to {altitude}m...")
+        def _takeoff_thread():
+            try:
+                # Ensure event loop exists for async operations
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Execute takeoff
+                print(f"Taking off to {altitude}m...")
+                client.takeoffAsync(vehicle_name="Drone1").join()
+                
+                # Move to target altitude
+                client.moveToZAsync(-altitude, 2, vehicle_name="Drone1").join()
+                
+                print("Takeoff complete!")
+                
+                # Set hold position
+                self.hold_position = np.array([0.0, 0.0, -altitude])
+            except Exception as e:
+                print(f"Takeoff failed: {e}")
 
-            print("Takeoff complete!")
-
-            # Set hold position
-            self.hold_position = np.array([0.0, 0.0, -altitude])
-            return True
-        except Exception as e:
-            print(f"Takeoff failed: {e}")
-            return False
+        # Run takeoff in a separate thread to avoid blocking
+        takeoff_thread = threading.Thread(target=_takeoff_thread, daemon=True)
+        takeoff_thread.start()
+        return True
 
     def land(self) -> bool:
         """Perform automated landing."""
@@ -490,7 +520,7 @@ class QuadcopterController:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
 
-            client.landAsync().join()
+            client.landAsync(vehicle_name="Drone1").join()
             print("Landing complete!")
             return True
         except Exception as e:
@@ -507,8 +537,8 @@ class QuadcopterController:
         client = self.client
         if client is not None and self.connected:
             try:
-                client.armDisarm(False)
-                client.enableApiControl(False)
+                client.armDisarm(False, vehicle_name="Drone1")
+                client.enableApiControl(False, vehicle_name="Drone1")
                 client.reset()
                 time.sleep(0.5)
             except Exception as e:
@@ -537,7 +567,7 @@ class QuadcopterController:
         if client is not None and self.connected and self.armed:
             try:
                 # Immediate hover
-                client.hoverAsync()
+                client.hoverAsync(vehicle_name="Drone1")
 
                 # Vibrate controller
                 if self.input_handler:
@@ -558,12 +588,14 @@ class QuadcopterController:
         Returns:
             Dictionary with position, velocity, attitude data
         """
-        client = self.client
+        # Use control_client if available (thread-safe), otherwise fall back to main client
+        client = self.control_client if self.control_client is not None else self.client
         if client is None:
+            print("[DEBUG] No AirSim client available")
             return None
 
         try:
-            state = client.getMultirotorState()
+            state = client.getMultirotorState(vehicle_name="Drone1")
 
             # Position (NED frame)
             pos = state.kinematics_estimated.position
@@ -638,17 +670,24 @@ class QuadcopterController:
         # Get button events
         buttons = handler.get_button_events()
 
+        # Debug: print any button presses
+        if any(buttons.values()):
+            print(f"[DEBUG] Button events detected: {buttons}")
+
         # Handle button events
         if buttons["arm_toggle"]:
+            print(f"[DEBUG] ARM TOGGLE pressed! Currently armed: {self.armed}")
             if self.armed:
                 self.disarm()
             else:
                 self.arm()
 
         if buttons["emergency_stop"]:
+            print("[DEBUG] EMERGENCY STOP pressed!")
             self.emergency_stop_handler()
 
         if buttons["reset"]:
+            print("[DEBUG] RESET pressed!")
             self.reset()
 
         if buttons["mode_toggle"]:
@@ -656,9 +695,13 @@ class QuadcopterController:
             modes = ["velocity", "position", "attitude"]
             current_idx = modes.index(self.control_mode)
             self.control_mode = modes[(current_idx + 1) % len(modes)]
-            print(f"Control mode: {self.control_mode}")
+            print(f"[DEBUG] Control mode changed to: {self.control_mode}")
 
         # Scale commands to actual values
+        # Debug: print raw commands occasionally
+        if any(buttons.values()) or abs(commands["pitch"]) > 0.1 or abs(commands["throttle"]) > 0.1:
+            print(f"[DEBUG] Raw Flight Commands: {commands}")
+
         vx = commands["pitch"] * self.config.max_velocity_xy  # Forward/back
         vy = commands["roll"] * self.config.max_velocity_xy  # Left/right
         vz = -commands["altitude_rate"] * self.config.max_velocity_z  # Up/down (NED)
@@ -712,7 +755,8 @@ class QuadcopterController:
             commands: Processed control commands
             dt: Time step
         """
-        client = self.client
+        # Use control_client (thread-safe) if available
+        client = self.control_client if self.control_client is not None else self.client
         if client is None or not self.armed or self.emergency_stop:
             return
 
@@ -732,6 +776,7 @@ class QuadcopterController:
                     duration=dt * 2,
                     drivetrain=airsim.DrivetrainType.MaxDegreeOfFreedom,
                     yaw_mode=airsim.YawMode(True, yaw_rate),
+                    vehicle_name="Drone1",
                 )
 
             elif self.control_mode == "position":
@@ -755,6 +800,7 @@ class QuadcopterController:
                     self.hold_position[2],
                     velocity=self.config.max_velocity_xy,
                     yaw_mode=airsim.YawMode(False, self.hold_yaw),
+                    vehicle_name="Drone1",
                 )
 
         except Exception as e:
@@ -815,29 +861,65 @@ class QuadcopterController:
         - WCET monitoring
         - Deadline management
         """
+        # Create new event loop for this thread (required for cosysairsim)
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            print("[DEBUG] Created new asyncio event loop for control thread")
+        except Exception as e:
+            print(f"[DEBUG] Event loop setup warning: {e}")
+        
+        # Create thread-local AirSim client (CRITICAL: must be in same thread that uses it)
+        try:
+            print("[DEBUG] Creating thread-local AirSim client...")
+            self.control_client = airsim.MultirotorClient()
+            self.control_client.confirmConnection()
+            print("[DEBUG] Control thread AirSim client connected successfully!")
+        except Exception as e:
+            print(f"[DEBUG] Failed to create control thread client: {e}")
+            import traceback
+            traceback.print_exc()
+            return
+        
         timing_analyzer = self.timing_analyzer
         if timing_analyzer is None:
             raise RuntimeError("Timing analyzer not initialized")
 
-        print(f"\nStarting control loop at {self.config.control_rate_hz}Hz")
-        print(f"Loop period: {self.loop_period_ms:.2f}ms")
-        print(f"Deadline margin: {self.config.deadline_margin_ms}ms")
+        print(f"\n[DEBUG] Starting control loop at {self.config.control_rate_hz}Hz")
+        print(f"[DEBUG] Loop period: {self.loop_period_ms:.2f}ms")
+        print(f"[DEBUG] Deadline margin: {self.config.deadline_margin_ms}ms")
+        print(f"[DEBUG] Connected: {self.connected}, Armed: {self.armed}")
         print("-" * 50)
 
         self.start_time = time.perf_counter()
         next_loop_time = self.start_time
+        debug_counter = 0
 
         while self.running:
             loop_start = time.perf_counter()
+            debug_counter += 1
+
+            # Print debug every 50 loops (1 second at 50Hz)
+            debug_print = (debug_counter % 50 == 1)
 
             try:
                 # Phase 1: Get drone state from simulator
+                if debug_print:
+                    print(f"[DEBUG Loop {debug_counter}] Phase 1: Getting drone state...")
                 state = self._get_drone_state()
                 if state is None:
+                    if debug_print:
+                        print(f"[DEBUG Loop {debug_counter}] State is None, skipping...")
                     continue
+                if debug_print:
+                    print(f"[DEBUG Loop {debug_counter}] State OK - Pos: ({state['position'][0]:.2f}, {state['position'][1]:.2f}, {state['position'][2]:.2f})")
 
                 # Phase 2: Process input from controller/keyboard
+                if debug_print:
+                    print(f"[DEBUG Loop {debug_counter}] Phase 2: Processing input...")
                 commands = self._process_input()
+                if debug_print:
+                    print(f"[DEBUG Loop {debug_counter}] Input: vx={commands['vx']:.2f}, vy={commands['vy']:.2f}, vz={commands['vz']:.2f}, armed={self.armed}")
 
                 # Phase 3: Check safety constraints
                 if not self._check_safety(state):
@@ -852,6 +934,8 @@ class QuadcopterController:
                     }
 
                 # Phase 4: Send control command
+                if debug_print:
+                    print(f"[DEBUG Loop {debug_counter}] Phase 4: Sending control (armed={self.armed})...")
                 self._send_control_command(commands, self.loop_period_s)
 
                 # Phase 5: Update GUI (lower priority)
@@ -860,12 +944,16 @@ class QuadcopterController:
                     % int(self.config.control_rate_hz / self.config.gui_update_rate_hz)
                     == 0
                 ):
+                    if debug_print:
+                        print(f"[DEBUG Loop {debug_counter}] Phase 5: Updating GUI...")
                     self._update_gui(
                         state, commands, (time.perf_counter() - loop_start) * 1000
                     )
 
             except Exception as e:
-                print(f"Control loop error: {e}")
+                print(f"[DEBUG] Control loop error: {e}")
+                import traceback
+                traceback.print_exc()
 
             # Record timing
             loop_end = time.perf_counter()
@@ -883,7 +971,7 @@ class QuadcopterController:
 
             self.loop_count += 1
 
-        print("\nControl loop stopped.")
+        print("\n[DEBUG] Control loop stopped.")
         self._print_timing_statistics()
 
     def _print_timing_statistics(self):
@@ -928,16 +1016,20 @@ class QuadcopterController:
     def stop_control_loop(self):
         """Stop the control loop."""
         self.running = False
-        if self.control_thread:
-            self.control_thread.join(timeout=2.0)
+        if self.control_thread and self.control_thread.is_alive():
+            try:
+                self.control_thread.join(timeout=2.0)
+            except (KeyboardInterrupt, Exception):
+                # Thread join was interrupted, thread will terminate on its own
+                pass
 
         # Hover if armed
         if self.armed and self.connected:
             try:
                 client = self.client
                 if client:
-                    client.hoverAsync()
-            except:
+                    client.hoverAsync(vehicle_name="Drone1")
+            except Exception:
                 pass
 
     def run(self):
@@ -964,19 +1056,28 @@ class QuadcopterController:
         # Main application loop
         try:
             print("\nPress Ctrl+C to exit\n")
-
-            while True:
-                if self.gui and not self.gui.is_running():
-                    print("GUI closed. Exiting...")
-                    break
-
-                time.sleep(0.1)
+            print("[DEBUG] Running GUI mainloop in main thread...")
+            
+            # Run tkinter mainloop in main thread (required for Windows)
+            if self.gui:
+                self.gui.run_mainloop()
+            else:
+                # No GUI mode - just wait
+                while True:
+                    time.sleep(0.1)
 
         except KeyboardInterrupt:
             print("\n\nShutdown requested...")
-
-        # Cleanup
-        self.cleanup()
+        except Exception as e:
+            print(f"\nUnexpected error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Cleanup - always runs
+            try:
+                self.cleanup()
+            except Exception as e:
+                print(f"Error during cleanup: {e}")
 
     def _print_instructions(self):
         """Print control instructions."""
@@ -1010,20 +1111,32 @@ class QuadcopterController:
         """Clean up resources."""
         print("\nCleaning up...")
 
-        # Stop control loop
-        self.stop_control_loop()
+        # Stop control loop first
+        try:
+            self.stop_control_loop()
+        except Exception as e:
+            print(f"Warning during stop_control_loop: {e}")
 
         # Disarm and disconnect
-        if self.armed:
-            self.disarm()
+        try:
+            if self.armed:
+                self.disarm()
+        except Exception as e:
+            print(f"Warning during disarm: {e}")
 
         # Stop input handler
-        if self.input_handler:
-            self.input_handler.stop_vibration()
+        try:
+            if self.input_handler:
+                self.input_handler.stop_vibration()
+        except Exception as e:
+            print(f"Warning during input cleanup: {e}")
 
         # Stop GUI
-        if self.gui:
-            self.gui.stop()
+        try:
+            if self.gui:
+                self.gui.stop()
+        except Exception as e:
+            print(f"Warning during GUI cleanup: {e}")
 
         print("Cleanup complete. Goodbye!")
 
