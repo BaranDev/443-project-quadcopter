@@ -150,3 +150,6 @@ config_local.py
 settings_local.json
 
 Blocks/
+Windows/
+EDIT_REPORT.md
+REPORT.md

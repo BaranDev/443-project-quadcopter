@@ -101,7 +101,7 @@ class AttitudeIndicator(tk.Canvas):
         self._draw()
 
     def _draw(self):
-        """Draw the attitude indicator."""
+        """Draw the attitude indicator with proper roll rotation."""
         self.delete("all")
 
         center = self.center
@@ -111,26 +111,60 @@ class AttitudeIndicator(tk.Canvas):
         roll_rad = math.radians(self.roll)
         pitch_offset = self.pitch * 2  # Scale pitch to pixels
 
-        # Draw sky/ground (simplified - no rotation for clarity)
-        horizon_y = center + pitch_offset
+        # Calculate rotated horizon line endpoints
+        # The horizon rotates around center based on roll
+        # and shifts up/down based on pitch
+        horizon_length = self.size * 2  # Long enough to cover corners when rotated
+        
+        # Horizon center point (shifted by pitch)
+        hx = center
+        hy = center + pitch_offset
+        
+        # Calculate rotated endpoints
+        dx = horizon_length / 2 * math.cos(roll_rad)
+        dy = horizon_length / 2 * math.sin(roll_rad)
+        
+        x1, y1 = hx - dx, hy - dy
+        x2, y2 = hx + dx, hy + dy
+        
+        # Create clipping region (circular)
+        # Draw sky and ground as polygons that rotate with the horizon
+        
+        # Sky polygon (above the tilted horizon)
+        sky_points = [
+            x1, y1,
+            x2, y2,
+            x2 - horizon_length * math.sin(roll_rad), y2 - horizon_length * math.cos(roll_rad),
+            x1 - horizon_length * math.sin(roll_rad), y1 - horizon_length * math.cos(roll_rad),
+        ]
+        self.create_polygon(*sky_points, fill=self.sky_color, outline="")
+        
+        # Ground polygon (below the tilted horizon)
+        ground_points = [
+            x1, y1,
+            x2, y2,
+            x2 + horizon_length * math.sin(roll_rad), y2 + horizon_length * math.cos(roll_rad),
+            x1 + horizon_length * math.sin(roll_rad), y1 + horizon_length * math.cos(roll_rad),
+        ]
+        self.create_polygon(*ground_points, fill=self.ground_color, outline="")
 
-        # Sky (top half)
-        self.create_rectangle(
-            0, 0, self.size, horizon_y, fill=self.sky_color, outline=""
+        # Horizon line (tilted)
+        self.create_line(x1, y1, x2, y2, fill=self.horizon_color, width=2)
+
+        # Draw circular mask/border to hide overflow
+        self.create_oval(
+            center - radius - 2, center - radius - 2,
+            center + radius + 2, center + radius + 2,
+            outline="#1a1a2e", width=20
+        )
+        self.create_oval(
+            center - radius, center - radius,
+            center + radius, center + radius,
+            outline="white", width=2
         )
 
-        # Ground (bottom half)
-        self.create_rectangle(
-            0, horizon_y, self.size, self.size, fill=self.ground_color, outline=""
-        )
-
-        # Horizon line
-        self.create_line(
-            0, horizon_y, self.size, horizon_y, fill=self.horizon_color, width=2
-        )
-
-        # Roll indicator arc
-        arc_radius = radius - 15
+        # Roll indicator arc at top
+        arc_radius = radius - 5
         self.create_arc(
             center - arc_radius,
             center - arc_radius,
@@ -143,21 +177,19 @@ class AttitudeIndicator(tk.Canvas):
             width=1,
         )
 
-        # Roll indicator triangle
-        roll_x = center + arc_radius * math.sin(roll_rad)
-        roll_y = center - arc_radius * math.cos(roll_rad)
+        # Roll indicator triangle (fixed at top, shows current roll)
+        indicator_angle = -roll_rad  # Opposite direction to show bank
+        tri_x = center + arc_radius * math.sin(indicator_angle)
+        tri_y = center - arc_radius * math.cos(indicator_angle)
         self.create_polygon(
-            roll_x,
-            roll_y - 8,
-            roll_x - 5,
-            roll_y,
-            roll_x + 5,
-            roll_y,
+            center, center - arc_radius + 8,
+            center - 5, center - arc_radius,
+            center + 5, center - arc_radius,
             fill="yellow",
             outline="white",
         )
 
-        # Aircraft symbol (center reference)
+        # Aircraft symbol (fixed reference at center)
         self.create_line(
             center - 30, center, center - 10, center, fill="yellow", width=3
         )
@@ -173,14 +205,31 @@ class AttitudeIndicator(tk.Canvas):
             outline="yellow",
         )
 
-        # Pitch ladder lines
+        # Pitch ladder lines (rotated with horizon)
         for pitch_mark in [-20, -10, 10, 20]:
-            y = center + pitch_offset - pitch_mark * 2
-            if 20 < y < self.size - 20:
-                self.create_line(center - 20, y, center + 20, y, fill="white", width=1)
+            # Calculate position relative to horizon center
+            mark_y_offset = pitch_offset - pitch_mark * 2
+            
+            # Rotate the line endpoints based on roll
+            line_half_width = 15 if abs(pitch_mark) == 10 else 25
+            
+            # Center of this pitch mark
+            mark_cx = center
+            mark_cy = center + mark_y_offset
+            
+            # Calculate rotated endpoints
+            ldx = line_half_width * math.cos(roll_rad)
+            ldy = line_half_width * math.sin(roll_rad)
+            
+            lx1, ly1 = mark_cx - ldx, mark_cy - ldy
+            lx2, ly2 = mark_cx + ldx, mark_cy + ldy
+            
+            # Only draw if within visible area
+            if 25 < mark_cy < self.size - 25:
+                self.create_line(lx1, ly1, lx2, ly2, fill="white", width=1)
+                # Add pitch value text
                 self.create_text(
-                    center + 30,
-                    y,
+                    lx2 + 8, ly2,
                     text=str(pitch_mark),
                     fill="white",
                     font=("Arial", 7),
@@ -632,35 +681,29 @@ class VisualizationGUI:
                 col += 1
             row += 1
 
-        # History table (last 10 values)
+        # History table (last 10 values) - fixed size
         history_frame = ttk.LabelFrame(parent, text="Position History (Last 10)")
-        history_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        history_frame.pack(fill=tk.X, pady=5)
 
-        # Create treeview for history
+        # Create treeview for history (fixed 10 rows)
         columns = ("idx", "x", "y", "z", "vx", "vy", "vz")
         self.history_tree = ttk.Treeview(
             history_frame, columns=columns, show="headings", height=10
         )
 
         self.history_tree.heading("idx", text="#")
-        self.history_tree.heading("x", text="X (m)")
-        self.history_tree.heading("y", text="Y (m)")
-        self.history_tree.heading("z", text="Z (m)")
-        self.history_tree.heading("vx", text="Vx (m/s)")
-        self.history_tree.heading("vy", text="Vy (m/s)")
-        self.history_tree.heading("vz", text="Vz (m/s)")
+        self.history_tree.heading("x", text="X")
+        self.history_tree.heading("y", text="Y")
+        self.history_tree.heading("z", text="Z")
+        self.history_tree.heading("vx", text="Vx")
+        self.history_tree.heading("vy", text="Vy")
+        self.history_tree.heading("vz", text="Vz")
 
         for col in columns:
-            self.history_tree.column(col, width=70, anchor="center")
-        self.history_tree.column("idx", width=30)
+            self.history_tree.column(col, width=50, anchor="center")
+        self.history_tree.column("idx", width=25)
 
-        scrollbar = ttk.Scrollbar(
-            history_frame, orient=tk.VERTICAL, command=self.history_tree.yview
-        )
-        self.history_tree.configure(yscrollcommand=scrollbar.set)
-
-        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_tree.pack(fill=tk.X)
 
         # Real-time metrics
         metrics_frame = ttk.LabelFrame(parent, text="Real-Time Metrics")
@@ -723,6 +766,37 @@ class VisualizationGUI:
         )
         self.arm_status.pack(side=tk.LEFT, padx=10)
 
+        # PID Toggle
+        pid_toggle_frame = ttk.Frame(control_frame)
+        pid_toggle_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.pid_enabled = tk.BooleanVar(value=True)
+        self.pid_check = ttk.Checkbutton(
+            pid_toggle_frame, 
+            text="Enable PID Controller", 
+            variable=self.pid_enabled,
+            command=self._on_apply_params  # Update immediately
+        )
+        self.pid_check.pack(side=tk.LEFT)
+        
+        # Hover Toggle
+        hover_toggle_frame = ttk.Frame(control_frame)
+        hover_toggle_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        self.hover_enabled = tk.BooleanVar(value=False)
+        self.hover_check = ttk.Checkbutton(
+            hover_toggle_frame, 
+            text="Enable Hover (hold position)", 
+            variable=self.hover_enabled,
+            command=self._on_hover_toggle
+        )
+        self.hover_check.pack(side=tk.LEFT)
+        
+        self.hover_status = ttk.Label(
+            hover_toggle_frame, text="OFF", foreground="gray", font=("Arial", 9, "bold")
+        )
+        self.hover_status.pack(side=tk.LEFT, padx=10)
+
         # Connection status
         conn_frame = ttk.Frame(control_frame)
         conn_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -745,6 +819,26 @@ class VisualizationGUI:
         for text, value in modes:
             rb = ttk.Radiobutton(
                 mode_frame, text=text, value=value, variable=self.control_mode
+            )
+            rb.pack(anchor="w", padx=5)
+            
+        # Integration Method selection
+        int_frame = ttk.LabelFrame(parent, text="Integration Method")
+        int_frame.pack(fill=tk.X, pady=5)
+
+        self.int_method = tk.StringVar(value="euler")
+        int_methods = [
+            ("Euler", "euler"),
+            ("Runge-Kutta 4", "rk4"),
+        ]
+
+        for text, value in int_methods:
+            rb = ttk.Radiobutton(
+                int_frame, 
+                text=text, 
+                value=value, 
+                variable=self.int_method,
+                command=self._on_apply_params
             )
             rb.pack(anchor="w", padx=5)
 
@@ -875,6 +969,16 @@ class VisualizationGUI:
         if self._on_arm:
             self._on_arm(armed)
 
+    def _on_hover_toggle(self):
+        """Handle Hover checkbox toggle."""
+        enabled = self.hover_enabled.get()
+        if self.hover_status:
+            if enabled:
+                self.hover_status.configure(text="ON", foreground="green")
+            else:
+                self.hover_status.configure(text="OFF", foreground="gray")
+        self._on_apply_params()
+
     def _on_apply_params(self):
         """Handle Apply Parameters button click."""
         params = {}
@@ -882,6 +986,14 @@ class VisualizationGUI:
             params[key] = var.get()
         for key, var in self.pid_entries.items():
             params[key] = var.get()
+            
+        # Add new parameters
+        if hasattr(self, "pid_enabled"):
+            params["pid_enabled"] = self.pid_enabled.get()
+        if hasattr(self, "int_method"):
+            params["integration_method"] = self.int_method.get()
+        if hasattr(self, "hover_enabled"):
+            params["hover_enabled"] = self.hover_enabled.get()
 
         if self._on_parameter_change:
             self._on_parameter_change(params)
@@ -952,6 +1064,33 @@ class VisualizationGUI:
                 else:
                     self.arm_var.set(False)
                     self.arm_status.configure(text="DISARMED", foreground="red")
+                    
+                # Update position/velocity history for the table
+                self.position_history.append((data.x, data.y, data.z))
+                self.velocity_history.append((data.vx, data.vy, data.vz))
+                # Keep only last 10
+                if len(self.position_history) > 10:
+                    self.position_history.pop(0)
+                if len(self.velocity_history) > 10:
+                    self.velocity_history.pop(0)
+                    
+                # Update history table
+                if self.history_tree:
+                    # Clear existing
+                    for item in self.history_tree.get_children():
+                        self.history_tree.delete(item)
+                    # Add new data
+                    for i, (pos, vel) in enumerate(zip(self.position_history, self.velocity_history)):
+                        values = (
+                            i + 1,
+                            f"{pos[0]:.2f}",
+                            f"{pos[1]:.2f}",
+                            f"{pos[2]:.2f}",
+                            f"{vel[0]:.2f}",
+                            f"{vel[1]:.2f}",
+                            f"{vel[2]:.2f}",
+                        )
+                        self.history_tree.insert("", "end", values=values)
 
         except queue.Empty:
             pass

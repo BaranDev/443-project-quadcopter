@@ -250,10 +250,16 @@ class QuadcopterController:
 
         # Control mode
         self.control_mode = "velocity"  # velocity, position, attitude
+        self.is_taking_off = False # Flag to prevent control loop conflict during takeoff
 
         # Position hold
         self.hold_position = np.array([0.0, 0.0, -3.0])  # NED
         self.hold_yaw = 0.0
+        
+        # New Feature Flags
+        self.pid_enabled = True
+        self.integration_method = "euler"  # euler or rk4
+        self.hover_enabled = False  # Whether to hold position when no input
 
         # Telemetry
         self.current_position = np.zeros(3)
@@ -329,6 +335,10 @@ class QuadcopterController:
         # Get drone mass from settings (default 1.0 kg)
         self.pid_controller = QuadcopterPIDController(mass=1.0, gravity=9.81)
         print("PID controller initialized.")
+        
+        # Initialize QuadcopterModel for local simulation features (e.g. integration method)
+        self.model = QuadcopterModel()
+        print("QuadcopterModel initialized for local simulation features.")
 
         # Initialize timing analyzer
         self.timing_analyzer = TimingAnalyzer(
@@ -379,6 +389,27 @@ class QuadcopterController:
     def _on_gui_parameter_change(self, params: Dict):
         """Handle GUI parameter changes."""
         print(f"Parameters updated: {params}")
+
+        # Handle PID enable/disable
+        if "pid_enabled" in params:
+            self.pid_enabled = params["pid_enabled"]
+            print(f"PID Controller: {'Enabled' if self.pid_enabled else 'Disabled'}")
+
+        # Handle integration method
+        if "integration_method" in params and self.model:
+            method_str = params["integration_method"]
+            try:
+                # Map string to IntegrationMethod enum
+                method_enum = IntegrationMethod(method_str)
+                self.model.set_integration_method(method_enum)
+                print(f"[DEBUG] Integration method set to: {method_enum.name}")
+            except ValueError:
+                print(f"[DEBUG] Invalid integration method: {method_str}")
+
+        # Handle hover enable/disable
+        if "hover_enabled" in params:
+            self.hover_enabled = params["hover_enabled"]
+            print(f"Hover: {'Enabled' if self.hover_enabled else 'Disabled'}")
 
         pid = self.pid_controller
         if pid is None:
@@ -486,12 +517,18 @@ class QuadcopterController:
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
                 
+                # Create thread-local AirSim client (CRITICAL: same thread must create and use client)
+                print("[DEBUG] Creating takeoff thread AirSim client...")
+                takeoff_client = airsim.MultirotorClient()
+                takeoff_client.confirmConnection()
+                print("[DEBUG] Takeoff thread client connected!")
+                
                 # Execute takeoff
                 print(f"Taking off to {altitude}m...")
-                client.takeoffAsync(vehicle_name="Drone1").join()
+                takeoff_client.takeoffAsync(vehicle_name="Drone1").join()
                 
                 # Move to target altitude
-                client.moveToZAsync(-altitude, 2, vehicle_name="Drone1").join()
+                takeoff_client.moveToZAsync(-altitude, 2, vehicle_name="Drone1").join()
                 
                 print("Takeoff complete!")
                 
@@ -499,8 +536,14 @@ class QuadcopterController:
                 self.hold_position = np.array([0.0, 0.0, -altitude])
             except Exception as e:
                 print(f"Takeoff failed: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                self.is_taking_off = False
+                print("[DEBUG] is_taking_off set to False")
 
         # Run takeoff in a separate thread to avoid blocking
+        self.is_taking_off = True
         takeoff_thread = threading.Thread(target=_takeoff_thread, daemon=True)
         takeoff_thread.start()
         return True
@@ -609,14 +652,38 @@ class QuadcopterController:
             orient = state.kinematics_estimated.orientation
 
             # Convert quaternion to Euler angles
+            # Try airsim built-in function first
             to_euler_func = getattr(airsim, "to_eulerian_angles", None)
             if to_euler_func is None:
                 to_euler_func = getattr(airsim, "to_eularian_angles", None)
 
+            if to_euler_func is not None:
+                try:
+                    pitch, roll, yaw = to_euler_func(orient)
+                except:
+                    to_euler_func = None
+            
             if to_euler_func is None:
-                pitch = roll = yaw = 0.0
-            else:
-                pitch, roll, yaw = to_euler_func(orient)
+                # Manual quaternion to Euler (ZYX convention)
+                w, x, y, z = orient.w_val, orient.x_val, orient.y_val, orient.z_val
+                
+                # Roll (x-axis rotation)
+                sinr_cosp = 2 * (w * x + y * z)
+                cosr_cosp = 1 - 2 * (x * x + y * y)
+                roll = math.atan2(sinr_cosp, cosr_cosp)
+                
+                # Pitch (y-axis rotation)
+                sinp = 2 * (w * y - z * x)
+                if abs(sinp) >= 1:
+                    pitch = math.copysign(math.pi / 2, sinp)  # Use 90 degrees if out of range
+                else:
+                    pitch = math.asin(sinp)
+                
+                # Yaw (z-axis rotation)
+                siny_cosp = 2 * (w * z + x * y)
+                cosy_cosp = 1 - 2 * (y * y + z * z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+            
             self.current_attitude = np.array(
                 [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
             )
@@ -767,6 +834,10 @@ class QuadcopterController:
 
         try:
             if self.control_mode == "velocity":
+                # If hover disabled and no input, skip sending commands (let drone drift)
+                if not self.hover_enabled and not commands["any_input"]:
+                    return
+                    
                 # Velocity control in body frame
                 # Duration slightly longer than loop period for smooth control
                 client.moveByVelocityBodyFrameAsync(
@@ -870,16 +941,18 @@ class QuadcopterController:
             print(f"[DEBUG] Event loop setup warning: {e}")
         
         # Create thread-local AirSim client (CRITICAL: must be in same thread that uses it)
-        try:
-            print("[DEBUG] Creating thread-local AirSim client...")
-            self.control_client = airsim.MultirotorClient()
-            self.control_client.confirmConnection()
-            print("[DEBUG] Control thread AirSim client connected successfully!")
-        except Exception as e:
-            print(f"[DEBUG] Failed to create control thread client: {e}")
-            import traceback
-            traceback.print_exc()
-            return
+        def connect_control_client():
+            try:
+                print("[DEBUG] Connecting control thread AirSim client...")
+                client = airsim.MultirotorClient()
+                client.confirmConnection()
+                print("[DEBUG] Control thread AirSim client connected successfully!")
+                return client
+            except Exception as e:
+                print(f"[DEBUG] Failed to create control thread client: {e}")
+                return None
+
+        self.control_client = connect_control_client()
         
         timing_analyzer = self.timing_analyzer
         if timing_analyzer is None:
@@ -903,14 +976,33 @@ class QuadcopterController:
             debug_print = (debug_counter % 50 == 1)
 
             try:
-                # Phase 1: Get drone state from simulator
-                if debug_print:
-                    print(f"[DEBUG Loop {debug_counter}] Phase 1: Getting drone state...")
-                state = self._get_drone_state()
-                if state is None:
+                # Phase 0: Check connection
+                if self.control_client is None:
                     if debug_print:
-                        print(f"[DEBUG Loop {debug_counter}] State is None, skipping...")
+                        print("[DEBUG] Reconnecting control client...")
+                    self.control_client = connect_control_client()
+                    if self.control_client is None:
+                         # Wait and retry
+                        time.sleep(1.0)
+                        continue
+
+                # Phase 1: Get drone state from simulator
+                try:
+                    if debug_print:
+                        print(f"[DEBUG Loop {debug_counter}] Phase 1: Getting drone state...")
+                    state = self._get_drone_state()
+                    if state is None:
+                        # If state is None, it might be a connection issue
+                        if debug_print:
+                           print(f"[DEBUG Loop {debug_counter}] State is None")
+                except Exception as e:
+                     print(f"[DEBUG] Connection lost: {e}")
+                     self.control_client = None # Force reconnect
+                     continue
+
+                if state is None:
                     continue
+
                 if debug_print:
                     print(f"[DEBUG Loop {debug_counter}] State OK - Pos: ({state['position'][0]:.2f}, {state['position'][1]:.2f}, {state['position'][2]:.2f})")
 
@@ -920,6 +1012,13 @@ class QuadcopterController:
                 commands = self._process_input()
                 if debug_print:
                     print(f"[DEBUG Loop {debug_counter}] Input: vx={commands['vx']:.2f}, vy={commands['vy']:.2f}, vz={commands['vz']:.2f}, armed={self.armed}")
+                    
+                # Applying PID Enable check
+                if not self.pid_enabled:
+                     # When PID is disabled, we might want to pass raw commands or do nothing
+                     # For now, let's just log it if debug is on
+                     if debug_print:
+                         print(f"[DEBUG] PID Disabled - Using raw inputs")
 
                 # Phase 3: Check safety constraints
                 if not self._check_safety(state):
@@ -934,6 +1033,21 @@ class QuadcopterController:
                     }
 
                 # Phase 4: Send control command
+                # Skip if taking off (let takeoff thread handle it)
+                if self.is_taking_off:
+                     if debug_print:
+                         print(f"[DEBUG Loop {debug_counter}] Taking off - skipping control command")
+                     # Still update GUI even during takeoff
+                     if (
+                         self.loop_count
+                         % int(self.config.control_rate_hz / self.config.gui_update_rate_hz)
+                         == 0
+                     ):
+                         self._update_gui(
+                             state, commands, (time.perf_counter() - loop_start) * 1000
+                         )
+                     continue
+
                 if debug_print:
                     print(f"[DEBUG Loop {debug_counter}] Phase 4: Sending control (armed={self.armed})...")
                 self._send_control_command(commands, self.loop_period_s)
@@ -952,8 +1066,13 @@ class QuadcopterController:
 
             except Exception as e:
                 print(f"[DEBUG] Control loop error: {e}")
-                import traceback
-                traceback.print_exc()
+                # Don't print full traceback for stream errors to reduce noise
+                if "StreamClosedError" in str(e) or "client is closed" in str(e).lower():
+                     print("[DEBUG] Stream closed, will reconnect.")
+                     self.control_client = None
+                else:
+                    import traceback
+                    traceback.print_exc()
 
             # Record timing
             loop_end = time.perf_counter()
